@@ -360,25 +360,41 @@ class DatasetProcessor:
         
         return frame_processed_actions
     
-    def process_frame(self, example: Dict, idx: int, frame_lines: Dict[int, List[List[int]]], 
-                     frame_processed_actions: Optional[Dict[int, Dict]] = None) -> Dict:
-        """Process a single frame to add depth and trace information.
-        
+    def process_frame(self, example: Dict, idx: int, frame_lines: Dict[int, List[List[int]]],
+                     frame_processed_actions: Optional[Dict[int, Dict]] = None,
+                     task_mapping: Optional[Dict[int, str]] = None,
+                     task_override: Optional[str] = None) -> Dict:
+        """Process a single frame to add depth, trace, and language_instruction.
+
         Args:
             example: Dataset example
             idx: Frame index
             frame_lines: Pre-computed trajectory lines
-            
+            frame_processed_actions: Pre-computed tokenized/chunked actions per frame
+            task_mapping: task_index -> language string lookup (from LeRobot metadata)
+            task_override: if set, every frame gets this language string regardless of task_index
+
         Returns:
-            Updated example with depth and trace
+            Updated example with depth, trace, processed_action, and language_instruction
         """
+        # Resolve language_instruction first so even error paths produce it
+        if task_override is not None:
+            example['language_instruction'] = task_override
+        elif 'language_instruction' not in example:
+            task_idx = example.get('task_index', 0)
+            if hasattr(task_idx, 'item'):
+                task_idx = task_idx.item()
+            example['language_instruction'] = (task_mapping or {}).get(int(task_idx), "")
+
         try:
             pil_image = self._get_image_from_example(example)
-            
+
             if pil_image is None:
                 print(f"Warning: No image found in frame {idx}")
                 example['depth'] = ""
                 example['trace'] = "[]"
+                if self.process_actions:
+                    example['processed_action'] = "{}"
                 return example
             
             # Convert PIL to cv2 format for depth model
@@ -468,44 +484,18 @@ class DatasetProcessor:
         print(f"Dataset loaded: {len(dataset)} frames")
         print(f"Features: {list(dataset.features.keys())}")
         
-        # Ensure required fields exist
-        required_fields = ['depth', 'trace', 'language_instruction']
-        if self.process_actions:
-            required_fields.append('processed_action')
-        
-        missing_fields = [f for f in required_fields if f not in dataset.features]
-        if missing_fields or task_override is not None:
-            if task_override is not None:
-                print(f"Overriding language_instruction with: {task_override!r}")
-            print(f"Adding missing fields: {missing_fields}")
-            
-            def add_fields(x):
-                result = {**x}
-                if 'depth' not in x:
-                    result['depth'] = ""
-                if 'trace' not in x:
-                    result['trace'] = "[]"
-                if 'processed_action' not in x:
-                    result['processed_action'] = "{}"
-                if task_override is not None:
-                    result['language_instruction'] = task_override
-                elif 'language_instruction' not in x:
-                    # Get task_index and look up instruction
-                    task_idx = x.get('task_index', 0)
-                    # Convert tensor to int if needed
-                    if hasattr(task_idx, 'item'):
-                        task_idx = task_idx.item()
-                    result['language_instruction'] = task_mapping.get(int(task_idx), "")
-                return result
-            
-            dataset = dataset.map(
-                add_fields,
-                desc="Adding missing fields"
-            )
-        
-        # Print sample frame fields for debugging
+        # NOTE: previously this stage ran a separate `dataset.map(add_fields)` pass
+        # to fill in `depth`/`trace`/`processed_action`/`language_instruction`. That
+        # pass re-encoded every image (LeRobot stores images inline in parquet) and
+        # dominated wall-clock — Phase 0 alone could run for tens of hours per shard
+        # before Phase 1 even started. We've folded the language_instruction lookup
+        # into `process_frame` itself (Phase 4) and let `dataset.map` add the
+        # depth/trace/processed_action columns on its first write, so we only
+        # pay the per-row IO cost once.
+        if task_override is not None:
+            print(f"Overriding language_instruction with: {task_override!r}")
         if len(dataset) > 0:
-            print(f"Sample frame fields: {list(dataset[0].keys())}")
+            print(f"Sample frame fields (pre-process): {list(dataset[0].keys())}")
         
         # Phase 1: Collect all gripper points
         episodes = self.collect_gripper_points(dataset)
@@ -519,14 +509,19 @@ class DatasetProcessor:
             action_episodes = self.collect_episode_actions(dataset)
             frame_processed_actions = self.process_episode_actions(action_episodes)
         
-        # Phase 4: Process all frames with depth, traces, and actions
+        # Phase 4: Process all frames with depth, traces, actions, and language_instruction.
+        # This is now the only `dataset.map` call — Phase 0's redundant per-image
+        # re-encode pass has been removed.
         print("Processing frames with all features...")
         dataset.reset_format()
         processed_dataset = dataset.map(
-            lambda example, idx: self.process_frame(example, idx, frame_lines, frame_processed_actions),
+            lambda example, idx: self.process_frame(
+                example, idx, frame_lines, frame_processed_actions,
+                task_mapping=task_mapping, task_override=task_override,
+            ),
             with_indices=True,
-            desc="Adding depth, trace, and action data",
-            num_proc=1  
+            desc="Adding depth, trace, action, and language data",
+            num_proc=1
         )
         
         # Save processed dataset

@@ -133,12 +133,19 @@ class DepthTokens:
 
 class Point:
     """Handle gripper point detection using Molmo."""
-    
-    def __init__(self):
-        """Initialize Molmo for gripper detection."""
+
+    def __init__(self, prompt: str = "point to the robot gripper"):
+        """Initialize Molmo for gripper detection.
+
+        Args:
+            prompt: text prompt forwarded to Molmo. Override for non-parallel-jaw
+                end-effectors (e.g. sprayer, suction cup) where "robot gripper"
+                returns nothing useful.
+        """
         self.point_at_gripper = point_at_gripper
+        self.prompt = prompt
         self._temp_counter = 0
-    
+
     def inference_point(self, image: Union[np.ndarray, Image.Image, str]) -> Optional[List[int]]:
         """Detect gripper point in image.
         
@@ -179,7 +186,7 @@ class Point:
         
         try:
             # Get gripper point
-            gripper_result = self.point_at_gripper(pil_image)
+            gripper_result = self.point_at_gripper(pil_image, prompt=self.prompt)
             
 
             print(f"Debug gripper result {gripper_result}")
@@ -291,14 +298,15 @@ def process_frame_with_classes(pil_image: Image.Image,
 class ActionProcessor:
     """Handle action processing: statistics, normalization, tokenization, and chunking."""
     
-    def __init__(self, tokenizer_model: str = "Qwen/Qwen2-7B", 
-                 bins: int = 256, 
-                 min_action: float = -1.0, 
+    def __init__(self, tokenizer_model: str = "Qwen/Qwen2-7B",
+                 bins: int = 256,
+                 min_action: float = -1.0,
                  max_action: float = 1.0,
                  action_dims: int = 7,
-                 chunk_size: int = 8):
+                 chunk_size: int = 8,
+                 normalize_dims: int = 6):
         """Initialize action processor.
-        
+
         Args:
             tokenizer_model: Pretrained tokenizer model name
             bins: Number of discretization bins
@@ -306,9 +314,15 @@ class ActionProcessor:
             max_action: Maximum action value for tokenization
             action_dims: Number of action dimensions
             chunk_size: Size of action chunks for horizon
+            normalize_dims: How many leading action dims get normalized
+                (mask=True). Trailing dims (e.g. binary gripper / sprayer
+                trigger) are left unnormalized. Default 6 matches the
+                7-dim DROID convention; for the 9-dim spraying schema
+                (8 joint deltas + 1 binary tool), pass 8.
         """
         self.action_dims = action_dims
         self.chunk_size = chunk_size
+        self.normalize_dims = normalize_dims
         self.json = json
         
         # Initialize tokenizer
@@ -329,7 +343,7 @@ class ActionProcessor:
         # Statistics will be computed from dataset
         self.stats = None
     
-    def compute_dataset_statistics(self, dataset, normalize_dims: int = 6) -> Dict:
+    def compute_dataset_statistics(self, dataset, normalize_dims: Optional[int] = None) -> Dict:
         """Compute action statistics from dataset.
         
         Args:
@@ -381,9 +395,11 @@ class ActionProcessor:
             raise ValueError("No actions found in dataset")
         
         actions_np = np.array(all_actions, dtype=np.float32)
-        
+
         # Create mask: True for dimensions to normalize, False for others (e.g., gripper)
         action_dim = actions_np.shape[1]
+        if normalize_dims is None:
+            normalize_dims = self.normalize_dims
         mask = [True] * min(normalize_dims, action_dim) + [False] * max(0, action_dim - normalize_dims)
         
         self.stats = {

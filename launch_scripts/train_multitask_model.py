@@ -298,9 +298,15 @@ if __name__ == "__main__":
             ], 1.0],
         ]
     elif args.mixture in ["robot-finetune"]:
+        # Path to the action-reasoning-processed dataset (output of
+        # preprocess/action_reasoning_data.py). Override per-run via
+        # MOLMOACT_FINETUNE_PATH instead of editing this file.
+        finetune_path = os.environ.get(
+            "MOLMOACT_FINETUNE_PATH", "/path/to/processed_dataset"
+        )
         tasks = [
             ["finetune", [
-                "finetune:/path/to/processed_dataset",
+                f"finetune:{finetune_path}",
             ], 1.0],
         ]
     else:

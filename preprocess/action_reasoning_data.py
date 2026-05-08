@@ -36,7 +36,7 @@ from processors import Depth, DepthTokens, Point, Trace, ActionProcessor
 class DatasetProcessor:
     """Main dataset processor that coordinates all processing steps."""
     
-    def __init__(self, 
+    def __init__(self,
                  depth_encoder: str = "vitb",
                  depth_checkpoint_dir: Optional[str] = None,
                  vqvae_model_path: Optional[str] = None,
@@ -44,7 +44,9 @@ class DatasetProcessor:
                  tokenizer_model: str = "Qwen/Qwen2-7B",
                  action_bins: int = 256,
                  action_chunk_size: int = 8,
-                 process_actions: bool = True):
+                 process_actions: bool = True,
+                 point_prompt: str = "point to the robot gripper",
+                 normalize_dims: int = 6):
         """Initialize all processors.
         
         Args:
@@ -66,16 +68,17 @@ class DatasetProcessor:
         # Initialize processors
         self.depth_processor = Depth(encoder=depth_encoder, ckpt_dir=depth_checkpoint_dir)
         self.token_processor = DepthTokens(model_path=vqvae_model_path)
-        self.point_processor = Point()
+        self.point_processor = Point(prompt=point_prompt)
         self.line_length = line_length
-        
+
         # Initialize action processor if needed
         self.process_actions = process_actions
         if process_actions:
             self.action_processor = ActionProcessor(
                 tokenizer_model=tokenizer_model,
                 bins=action_bins,
-                chunk_size=action_chunk_size
+                chunk_size=action_chunk_size,
+                normalize_dims=normalize_dims,
             )
         else:
             self.action_processor = None
@@ -606,7 +609,15 @@ def main():
                         help="Size of action chunks for horizon (default: 8)")
     parser.add_argument("--episodes", type=str, default=None,
                         help="Comma-separated list of episode indices to process (e.g., '0,1,2' or '0' for testing). Default: process all episodes")
-    
+    parser.add_argument("--point-prompt", type=str, default="point to the robot gripper",
+                        help="Prompt forwarded to Molmo for end-effector point detection. "
+                             "Override for non-parallel-jaw effectors (e.g. 'point to the spray nozzle').")
+    parser.add_argument("--normalize-dims", type=int, default=6,
+                        help="Number of leading action dims to normalize (mask=True). Trailing "
+                             "dims are left unnormalized (binary trigger / gripper). Default 6 "
+                             "matches 7-dim DROID. For the 9-dim spraying schema (8 joint deltas "
+                             "+ 1 binary tool) pass 8.")
+
     args = parser.parse_args()
     
     # Parse episodes argument
@@ -623,7 +634,9 @@ def main():
         tokenizer_model=args.tokenizer_model,
         action_bins=args.action_bins,
         action_chunk_size=args.action_chunk_size,
-        process_actions=args.process_actions
+        process_actions=args.process_actions,
+        point_prompt=args.point_prompt,
+        normalize_dims=args.normalize_dims,
     )
     
     # Process the dataset

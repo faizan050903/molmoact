@@ -425,7 +425,7 @@ class DatasetProcessor:
         
         return example
     
-    def process_dataset(self, dataset_path: str, output_path: Optional[str] = None, num_proc: int = 1, episodes: Optional[List[int]] = None):
+    def process_dataset(self, dataset_path: str, output_path: Optional[str] = None, num_proc: int = 1, episodes: Optional[List[int]] = None, task_override: Optional[str] = None):
         """Process entire dataset with depth and trace information.
         
         Args:
@@ -474,7 +474,9 @@ class DatasetProcessor:
             required_fields.append('processed_action')
         
         missing_fields = [f for f in required_fields if f not in dataset.features]
-        if missing_fields:
+        if missing_fields or task_override is not None:
+            if task_override is not None:
+                print(f"Overriding language_instruction with: {task_override!r}")
             print(f"Adding missing fields: {missing_fields}")
             
             def add_fields(x):
@@ -485,7 +487,9 @@ class DatasetProcessor:
                     result['trace'] = "[]"
                 if 'processed_action' not in x:
                     result['processed_action'] = "{}"
-                if 'language_instruction' not in x:
+                if task_override is not None:
+                    result['language_instruction'] = task_override
+                elif 'language_instruction' not in x:
                     # Get task_index and look up instruction
                     task_idx = x.get('task_index', 0)
                     # Convert tensor to int if needed
@@ -617,6 +621,10 @@ def main():
                              "dims are left unnormalized (binary trigger / gripper). Default 6 "
                              "matches 7-dim DROID. For the 9-dim spraying schema (8 joint deltas "
                              "+ 1 binary tool) pass 8.")
+    parser.add_argument("--task-override", type=str, default=None,
+                        help="Force every frame's language_instruction to this string, ignoring "
+                             "the LeRobot tasks.parquet mapping. Useful for relabeling a "
+                             "single-task dataset (e.g. 'spray the walls').")
 
     args = parser.parse_args()
     
@@ -640,7 +648,7 @@ def main():
     )
     
     # Process the dataset
-    processor.process_dataset(args.dataset_path, args.output_path, episodes=episodes)
+    processor.process_dataset(args.dataset_path, args.output_path, episodes=episodes, task_override=args.task_override)
 
 
 if __name__ == "__main__":

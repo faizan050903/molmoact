@@ -98,6 +98,11 @@ the bottom of this file):
 - `--normalize-dims 8` — normalize all 8 joint dims; leave dim 8 (binary
   sprayer trigger) unnormalized. Default is 6, which would wrongly leave
   `wrist_2` and `wrist_3` un-normalized.
+- `--task-override "spray the surface"` *(optional)* — relabel every frame's
+  `language_instruction` regardless of the LeRobot `tasks.parquet` mapping.
+  Useful if you ever need to relabel a single-task dataset without
+  re-converting; the spraying dataset already has the right label baked in
+  via openpi-10x's converter, so this flag isn't needed for the standard run.
 
 ```bash
 cd ~/Documents/git/molmoact

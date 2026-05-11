@@ -19,6 +19,21 @@ MERGED_OUT=${MERGED_OUT:-$HOME/data/molmoact/$(basename "$DATASET_REPO_ID")-proc
 LOG_DIR=${LOG_DIR:-$HOME/molmoact-logs}
 POINT_PROMPT=${POINT_PROMPT:-"point to the spray nozzle"}
 
+# Optional: subset of shard IDs to run (default: all NUM_GPUS).
+#   SHARDS="0 1 2 3 4 6" bash preprocess_parallel.sh
+# Each ID in SHARDS still pins to the GPU of the same numeric index.
+SHARDS=${SHARDS:-}
+
+# Optional: dir containing per-shard gripper-point cache JSONs (shard0.json,
+# shard1.json, ...). When set and the file exists, that shard skips the Molmo
+# call for cached frames. Build via extract_gripper_points_from_log.py.
+GRIPPER_POINTS_CACHE_DIR=${GRIPPER_POINTS_CACHE_DIR:-}
+
+# When SHARDS is set we typically want to resume an existing run rather than
+# regenerate everything. The merge step would then drop the unprocessed shards.
+# Default to skipping the merge so the caller can run it once everything is done.
+RUN_MERGE=${RUN_MERGE:-auto}
+
 cd "$HOME/molmoact"
 
 export DEPTH_CHECKPOINT_DIR="$HOME/Depth-Anything-V2/checkpoints"
@@ -38,8 +53,19 @@ echo "Dataset $DATASET_REPO_ID has $N_EPS episodes; sharding across $NUM_GPUS GP
 
 PER_GPU=$(( (N_EPS + NUM_GPUS - 1) / NUM_GPUS ))
 
+# Resolve which shard IDs to actually launch this run.
+if [ -z "$SHARDS" ]; then
+    SHARD_IDS=( $(seq 0 $((NUM_GPUS-1))) )
+else
+    read -r -a SHARD_IDS <<< "$SHARDS"
+fi
+echo "Running shards: ${SHARD_IDS[*]}"
+if [ -n "$GRIPPER_POINTS_CACHE_DIR" ]; then
+    echo "Looking for gripper-point caches in: $GRIPPER_POINTS_CACHE_DIR"
+fi
+
 PIDS=()
-for gpu in $(seq 0 $((NUM_GPUS-1))); do
+for gpu in "${SHARD_IDS[@]}"; do
     start=$(( gpu * PER_GPU ))
     end=$(( start + PER_GPU - 1 ))
     if [ $end -ge $N_EPS ]; then end=$(( N_EPS - 1 )); fi
@@ -51,7 +77,14 @@ for gpu in $(seq 0 $((NUM_GPUS-1))); do
 
     log="$LOG_DIR/preprocess_shard${gpu}.log"
     out="$OUT_BASE/shard${gpu}"
-    echo "  shard $gpu (eps $start-$end) on GPU $gpu -> $out (log: $log)"
+
+    cache_args=()
+    if [ -n "$GRIPPER_POINTS_CACHE_DIR" ] && [ -f "$GRIPPER_POINTS_CACHE_DIR/shard${gpu}.json" ]; then
+        cache_args=(--gripper-points-cache "$GRIPPER_POINTS_CACHE_DIR/shard${gpu}.json")
+        echo "  shard $gpu (eps $start-$end) on GPU $gpu -> $out  [resume from $GRIPPER_POINTS_CACHE_DIR/shard${gpu}.json]"
+    else
+        echo "  shard $gpu (eps $start-$end) on GPU $gpu -> $out"
+    fi
 
     CUDA_VISIBLE_DEVICES=$gpu nohup python preprocess/action_reasoning_data.py \
         --dataset-path "$DATASET_REPO_ID" \
@@ -64,6 +97,7 @@ for gpu in $(seq 0 $((NUM_GPUS-1))); do
         --normalize-dims 8 \
         --point-prompt "$POINT_PROMPT" \
         --episodes "$eps" \
+        "${cache_args[@]}" \
         > "$log" 2>&1 &
     PIDS+=($!)
 done
@@ -84,6 +118,29 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     echo "FAILED PIDs: ${FAILED[*]}" >&2
     echo "Inspect logs in $LOG_DIR/" >&2
     exit 1
+fi
+
+# Skip the merge step when only a subset of shards was requested (partial run).
+# Caller can re-invoke this script with no SHARDS set, or call merge_shards.py
+# directly, once all shards exist in $OUT_BASE.
+should_merge() {
+    case "$RUN_MERGE" in
+        yes|true|1) return 0 ;;
+        no|false|0) return 1 ;;
+        auto)
+            # auto: merge only if we ran all NUM_GPUS shards this invocation
+            [ ${#SHARD_IDS[@]} -ge "$NUM_GPUS" ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! should_merge; then
+    echo
+    echo "Skipping merge (partial run or RUN_MERGE=$RUN_MERGE)."
+    echo "When all shards are on disk in $OUT_BASE, run:"
+    echo "  python examples/spraying/merge_shards.py --shards-root $OUT_BASE --output-path $MERGED_OUT --dataset-name $(basename "$MERGED_OUT")"
+    exit 0
 fi
 
 echo "All shards complete. Merging into $MERGED_OUT..."

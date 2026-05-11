@@ -180,31 +180,47 @@ class DatasetProcessor:
         return int(ep_id)
     
     
-    def collect_gripper_points(self, dataset) -> Dict[int, List[Dict]]:
+    def collect_gripper_points(self, dataset, points_cache: Optional[List] = None) -> Dict[int, List[Dict]]:
         """Collect gripper points for all frames grouped by episode.
-        
+
         Args:
             dataset: HuggingFace dataset
-            
+            points_cache: optional pre-computed list `[[x_px, y_px] | None, ...]`
+                in dataset iteration order, typically extracted from a crashed
+                shard's log via `extract_gripper_points_from_log.py`. Frames
+                with an entry in the cache skip the Molmo call; frames past
+                the end of the cache (i.e. unprocessed when the previous run
+                died) fall through to a normal Molmo inference.
+
         Returns:
             Dictionary mapping episode_id to list of frame info
         """
-        print("Collecting gripper points...")
+        if points_cache is None:
+            points_cache = []
+        n_cached = sum(1 for p in points_cache if p is not None)
+        if points_cache:
+            print(f"Gripper-points cache provided: {n_cached}/{len(points_cache)} valid entries; running Molmo only for frames past index {len(points_cache)-1}.")
+        else:
+            print("Collecting gripper points...")
         episodes = {}
-        
+
         for idx, example in enumerate(tqdm(dataset, desc="Getting gripper points")):
 
             episode_id = self._get_episode_id(example)
             if idx < 5:  # Debug first 5 frames
                 print(f"Frame {idx}: episode_id = {episode_id}")
-            pil_image = self._get_image_from_example(example)
-            
-            if pil_image is None:
-                print(f"Warning: No image found in frame {idx}")
-                point = None
+
+            if idx < len(points_cache):
+                # Reuse the previously-computed point; skip Molmo.
+                point = points_cache[idx]
             else:
-                # Get gripper point using Point processor
-                point = self.point_processor.inference_point(pil_image)
+                pil_image = self._get_image_from_example(example)
+                if pil_image is None:
+                    print(f"Warning: No image found in frame {idx}")
+                    point = None
+                else:
+                    # Get gripper point using Point processor
+                    point = self.point_processor.inference_point(pil_image)
             
             # Group by episode
             if episode_id not in episodes:
@@ -441,7 +457,7 @@ class DatasetProcessor:
         
         return example
     
-    def process_dataset(self, dataset_path: str, output_path: Optional[str] = None, num_proc: int = 1, episodes: Optional[List[int]] = None, task_override: Optional[str] = None):
+    def process_dataset(self, dataset_path: str, output_path: Optional[str] = None, num_proc: int = 1, episodes: Optional[List[int]] = None, task_override: Optional[str] = None, gripper_points_cache_path: Optional[str] = None):
         """Process entire dataset with depth and trace information.
         
         Args:
@@ -497,8 +513,14 @@ class DatasetProcessor:
         if len(dataset) > 0:
             print(f"Sample frame fields (pre-process): {list(dataset[0].keys())}")
         
-        # Phase 1: Collect all gripper points
-        episodes = self.collect_gripper_points(dataset)
+        # Phase 1: Collect all gripper points (optionally seeded from a
+        # crashed-run log to skip the Molmo calls we already paid for).
+        points_cache = None
+        if gripper_points_cache_path:
+            with open(gripper_points_cache_path) as f:
+                points_cache = json.load(f)
+            print(f"Loaded gripper-points cache from {gripper_points_cache_path}: {len(points_cache)} entries")
+        episodes = self.collect_gripper_points(dataset, points_cache=points_cache)
         
         # Phase 2: Build trajectory lines
         frame_lines = self.build_trajectory_lines(episodes)
@@ -620,6 +642,12 @@ def main():
                         help="Force every frame's language_instruction to this string, ignoring "
                              "the LeRobot tasks.parquet mapping. Useful for relabeling a "
                              "single-task dataset (e.g. 'spray the walls').")
+    parser.add_argument("--gripper-points-cache", type=str, default=None,
+                        help="Path to a JSON list of pre-computed gripper points "
+                             "(`[[x_px, y_px] | None, ...]`) in dataset iteration order. "
+                             "Frames with a cache entry skip the Molmo call. Use "
+                             "extract_gripper_points_from_log.py to build this from a "
+                             "crashed shard's log so you don't have to redo Phase 1.")
 
     args = parser.parse_args()
     
@@ -643,7 +671,9 @@ def main():
     )
     
     # Process the dataset
-    processor.process_dataset(args.dataset_path, args.output_path, episodes=episodes, task_override=args.task_override)
+    processor.process_dataset(args.dataset_path, args.output_path, episodes=episodes,
+                              task_override=args.task_override,
+                              gripper_points_cache_path=args.gripper_points_cache)
 
 
 if __name__ == "__main__":

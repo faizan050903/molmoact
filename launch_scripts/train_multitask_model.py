@@ -12,6 +12,7 @@ from olmo.train.trainer_config import (
     WandbConfig, BatchDivisor, SpeedMonitorConfig,
     FSDPConfig, FSDPPrecision, CompilerConfig, TrainConfig
 )
+from torch.distributed.fsdp import ShardingStrategy
 from olmo.models.model import FSDPWrapStrategy
 from olmo.models.molmo.molmo import MolmoConfig
 from olmo.data.data_loader import DataLoaderConfig, RootSizeMixture
@@ -489,7 +490,16 @@ if __name__ == "__main__":
         fsdp=FSDPConfig(
             use_orig_params=True,
             wrapping_strategy=FSDPWrapStrategy.by_block_and_size,
-            precision=FSDPPrecision.float
+            precision=FSDPPrecision.float,
+            # With LoRA enabled, force NO_SHARD: each rank keeps the full model
+            # replica. FULL_SHARD breaks two ways with PEFT-wrapped models in
+            # PyTorch 2.7.1: (a) state_dict gather SIGSEGVs in FSDP's C++ post-hook,
+            # (b) our save bypass would write only a rank-local shard of each
+            # LoRA tensor (1/world_size of the data) since p.data is the shard.
+            # NO_SHARD makes p.data the full tensor on every rank, so the bypass
+            # is correct. Memory cost: ~16 GB bf16 model per GPU vs sharded ~2 GB;
+            # A100 80 GB has ample headroom.
+            sharding_strategy=ShardingStrategy.NO_SHARD if args.lora_enable else ShardingStrategy.FULL_SHARD,
         ),
         load_path=None,
         initial_model_checkpoint=checkpoint,

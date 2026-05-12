@@ -99,25 +99,40 @@ def main():
     if rank == 0:
         log("PEFT wrap done; trying to save state_dict...")
 
-    # Now invoke the same code path the trainer uses to save checkpoints
+    # --- Approach A: dist_cp_sd.get_model_state_dict (what the trainer uses today) ---
+    log("Approach A: dist_cp_sd.get_model_state_dict with full_state_dict=True...")
     from olmo.train.distributed_checkpointing import _prepare_state_dict
 
     try:
         state_dict = _prepare_state_dict(peft_model)
-    except AssertionError as e:
-        log(f"FAIL — assertion: {e}")
-        dist.destroy_process_group()
-        raise
+        if rank == 0:
+            log(f"  approach A OK: {len(state_dict['model'])} keys")
+    except BaseException as e:
+        log(f"  approach A FAIL: {type(e).__name__}: {e}")
+
+    # Sync ranks before next attempt
+    dist.barrier()
+
+    # --- Approach B: older FSDP.state_dict_type context manager ---
+    log("Approach B: FSDP.state_dict_type(FULL_STATE_DICT) context...")
+    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+
+    try:
+        # rank0_only=True means only rank 0 gets the gathered state; others get empty
+        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(peft_model, StateDictType.FULL_STATE_DICT, cfg):
+            sd = peft_model.state_dict()
+        if rank == 0:
+            keys = list(sd.keys())
+            has_lora = any("lora" in k for k in keys)
+            has_base = any("base_layer" in k for k in keys)
+            log(f"  approach B OK: {len(keys)} keys, has_lora={has_lora}, has_base={has_base}")
+            log(f"  sample key: {keys[0] if keys else '<empty>'}")
+    except BaseException as e:
+        log(f"  approach B FAIL: {type(e).__name__}: {e}")
 
     if rank == 0:
-        keys = list(state_dict["model"].keys())
-        log(f"state_dict has {len(keys)} keys, top-level: {list(state_dict.keys())}")
-        log(f"sample key: {keys[0] if keys else '<empty>'}")
-        # Confirm we got the LoRA-wrapped keys (sanity)
-        has_lora = any("lora" in k for k in keys)
-        has_base = any("base_layer" in k for k in keys)
-        log(f"has lora_*: {has_lora}, has base_layer.*: {has_base}")
-        log("PASS — checkpoint save path works with LoRA + FSDP1")
+        log("Test complete.")
 
     dist.destroy_process_group()
 

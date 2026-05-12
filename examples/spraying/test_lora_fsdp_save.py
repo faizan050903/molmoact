@@ -102,21 +102,25 @@ def main():
     if rank == 0:
         log("PEFT wrap done; trying to save state_dict...")
 
-    # Use peft.get_peft_model_state_dict — iterates named_parameters() directly
-    # instead of recursing through state_dict() (which triggers FSDP's broken hook).
-    # With NO_SHARD sharding strategy, each rank has the full parameter data, so
-    # rank 0's view is the complete LoRA state.
-    log("Bypass: peft.get_peft_model_state_dict (no FSDP state_dict() call)...")
-    from peft.utils.save_and_load import get_peft_model_state_dict
+    # Truly bypass state_dict(). peft.get_peft_model_state_dict() internally
+    # calls model.state_dict() which triggers FSDP's broken post-hook. Iterate
+    # named_parameters() directly — it walks Parameter objects only, doesn't
+    # invoke any state_dict hooks.
+    log("Bypass: named_parameters() direct iteration (no state_dict() call)...")
 
     try:
-        lora_state = get_peft_model_state_dict(peft_model)
+        lora_state = {}
+        for name, p in peft_model.named_parameters():
+            if "lora_" in name and p.requires_grad:
+                # With NO_SHARD, .data is the full tensor (replicated on each rank).
+                lora_state[name] = p.data.detach().cpu().clone()
         if rank == 0:
             keys = list(lora_state.keys())
-            log(f"OK: {len(keys)} LoRA keys")
+            total_params = sum(t.numel() for t in lora_state.values())
+            log(f"OK: {len(keys)} LoRA params, {total_params:,} total elements")
             log(f"sample key: {keys[0] if keys else '<empty>'}")
-            log(f"sample tensor shape: {lora_state[keys[0]].shape if keys else 'n/a'}")
-            log("PASS — peft.get_peft_model_state_dict works with NO_SHARD FSDP")
+            log(f"sample shape: {lora_state[keys[0]].shape if keys else 'n/a'}")
+            log("PASS — named_parameters() bypass works with NO_SHARD FSDP + PEFT")
     except BaseException as e:
         log(f"FAIL: {type(e).__name__}: {e}")
         raise

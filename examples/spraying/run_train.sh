@@ -141,6 +141,12 @@ torchrun \
     --lora_dropout 0.0 \
     --img_aug \
     --fsdp.fsdp2=False \
-    --save_intermediate_unsharded_checkpoint \
-    --save_final_unsharded_checkpoint \
     2>&1 | tee "${LOG_FILE}"
+# NOTE: --save_intermediate_unsharded_checkpoint and --save_final_unsharded_checkpoint
+# are intentionally OFF. Both flags trigger trainer.save_unsharded_checkpoint()
+# which calls olmo/train/checkpointer.py:save_unsharded → dist_cp_sd.get_model_state_dict
+# (a separate code path we don't patch), and that path hits PEFT's renamed
+# keys → KeyError mid-save. Our patched sharded save in
+# olmo/train/distributed_checkpointing.py already writes lora_state.pt with
+# all trainable params on rank 0 — that's the only file we need to reload
+# the LoRA adapter at inference time.

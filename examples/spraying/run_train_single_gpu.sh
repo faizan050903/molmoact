@@ -127,6 +127,9 @@ torchrun \
     --lora_dropout 0.0 \
     --img_aug \
     --fsdp.fsdp2=False \
-    --save_intermediate_unsharded_checkpoint \
-    --save_final_unsharded_checkpoint \
     2>&1 | tee "${LOG_FILE}"
+# NOTE: --save_intermediate_unsharded_checkpoint / --save_final_unsharded_checkpoint
+# intentionally OFF. They trigger save_unsharded_checkpoint() which calls
+# olmo/train/checkpointer.py:save_unsharded — a different code path that
+# uses dist_cp_sd.get_model_state_dict and hits PEFT's renamed keys.
+# Our patched sharded save writes lora_state.pt which is all we need.

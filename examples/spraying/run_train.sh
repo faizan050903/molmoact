@@ -20,6 +20,12 @@
 #   PyTorch 2.7.1+cu126 ships 2.26.2 — version skew segfaults gIB on this VM
 #   image). For single-node training NVLink P2P handles intra-node bandwidth
 #   anyway, so socket transport is functionally equivalent.
+# - --save_intermediate_unsharded_checkpoint / --save_final_unsharded_checkpoint:
+#   FSDP1's SHARDED_STATE_DICT post-hook expects un-wrapped param names like
+#   `attn_out.weight`, but PEFT's LoRA wrapper renames them to
+#   `attn_out.base_layer.weight` (plus lora_A/lora_B), so the sharded save
+#   asserts. The unsharded path gathers FULL_STATE_DICT on rank 0 and writes
+#   one consolidated checkpoint per save, sidestepping the buggy hook.
 
 set -euo pipefail
 
@@ -117,4 +123,6 @@ torchrun \
     --lora_dropout 0.0 \
     --img_aug \
     --fsdp.fsdp2=False \
+    --save_intermediate_unsharded_checkpoint \
+    --save_final_unsharded_checkpoint \
     2>&1 | tee "${LOG_FILE}"

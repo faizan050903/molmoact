@@ -22,6 +22,7 @@ AssertionError: FSDP assumes ...attn_out.weight is in the state_dict ...
 
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -72,10 +73,10 @@ def main():
     # Build model
     model = TinyModel(n_blocks=4, dim=256).to(local_rank)
 
-    # FSDP1 wrap matching production's "by_block_and_size" strategy
-    auto_wrap = lambda m, recurse, nonwrapped_numel: size_based_auto_wrap_policy(
-        m, recurse=recurse, nonwrapped_numel=nonwrapped_numel, min_num_params=1024
-    )
+    # FSDP1 wrap matching production's "by_block_and_size" strategy.
+    # Modern PyTorch calls the policy with module=/recurse=/nonwrapped_numel= kwargs,
+    # so bind min_num_params via functools.partial instead of a lambda.
+    auto_wrap = functools.partial(size_based_auto_wrap_policy, min_num_params=1024)
     fsdp_model = FSDP(
         model,
         use_orig_params=True,

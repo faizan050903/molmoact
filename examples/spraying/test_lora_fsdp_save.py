@@ -102,25 +102,21 @@ def main():
     if rank == 0:
         log("PEFT wrap done; trying to save state_dict...")
 
-    # Approach A (dist_cp_sd) segfaults uncatchably with FSDP1+PEFT in this env.
-    # Only test the older FSDP.state_dict_type context-manager API here.
-    log("FSDP.state_dict_type(FULL_STATE_DICT) context with rank0_only+cpu_offload...")
-    from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+    # Use peft.get_peft_model_state_dict — iterates named_parameters() directly
+    # instead of recursing through state_dict() (which triggers FSDP's broken hook).
+    # With NO_SHARD sharding strategy, each rank has the full parameter data, so
+    # rank 0's view is the complete LoRA state.
+    log("Bypass: peft.get_peft_model_state_dict (no FSDP state_dict() call)...")
+    from peft.utils.save_and_load import get_peft_model_state_dict
 
     try:
-        cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-        with FSDP.state_dict_type(peft_model, StateDictType.FULL_STATE_DICT, cfg):
-            sd = peft_model.state_dict()
+        lora_state = get_peft_model_state_dict(peft_model)
         if rank == 0:
-            keys = list(sd.keys())
-            has_lora = any("lora" in k for k in keys)
-            has_base = any("base_layer" in k for k in keys)
-            log(f"OK: {len(keys)} keys, has_lora={has_lora}, has_base={has_base}")
+            keys = list(lora_state.keys())
+            log(f"OK: {len(keys)} LoRA keys")
             log(f"sample key: {keys[0] if keys else '<empty>'}")
-            log("PASS — FSDP.state_dict_type works with LoRA + FSDP1")
-        else:
-            # On non-rank-0 with rank0_only=True the state_dict is empty by design
-            log(f"OK (empty state on non-rank-0, expected with rank0_only=True)")
+            log(f"sample tensor shape: {lora_state[keys[0]].shape if keys else 'n/a'}")
+            log("PASS — peft.get_peft_model_state_dict works with NO_SHARD FSDP")
     except BaseException as e:
         log(f"FAIL: {type(e).__name__}: {e}")
         raise

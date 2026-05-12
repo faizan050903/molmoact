@@ -99,26 +99,12 @@ def main():
     if rank == 0:
         log("PEFT wrap done; trying to save state_dict...")
 
-    # --- Approach A: dist_cp_sd.get_model_state_dict (what the trainer uses today) ---
-    log("Approach A: dist_cp_sd.get_model_state_dict with full_state_dict=True...")
-    from olmo.train.distributed_checkpointing import _prepare_state_dict
-
-    try:
-        state_dict = _prepare_state_dict(peft_model)
-        if rank == 0:
-            log(f"  approach A OK: {len(state_dict['model'])} keys")
-    except BaseException as e:
-        log(f"  approach A FAIL: {type(e).__name__}: {e}")
-
-    # Sync ranks before next attempt
-    dist.barrier()
-
-    # --- Approach B: older FSDP.state_dict_type context manager ---
-    log("Approach B: FSDP.state_dict_type(FULL_STATE_DICT) context...")
+    # Approach A (dist_cp_sd) segfaults uncatchably with FSDP1+PEFT in this env.
+    # Only test the older FSDP.state_dict_type context-manager API here.
+    log("FSDP.state_dict_type(FULL_STATE_DICT) context with rank0_only+cpu_offload...")
     from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
     try:
-        # rank0_only=True means only rank 0 gets the gathered state; others get empty
         cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         with FSDP.state_dict_type(peft_model, StateDictType.FULL_STATE_DICT, cfg):
             sd = peft_model.state_dict()
@@ -126,13 +112,15 @@ def main():
             keys = list(sd.keys())
             has_lora = any("lora" in k for k in keys)
             has_base = any("base_layer" in k for k in keys)
-            log(f"  approach B OK: {len(keys)} keys, has_lora={has_lora}, has_base={has_base}")
-            log(f"  sample key: {keys[0] if keys else '<empty>'}")
+            log(f"OK: {len(keys)} keys, has_lora={has_lora}, has_base={has_base}")
+            log(f"sample key: {keys[0] if keys else '<empty>'}")
+            log("PASS — FSDP.state_dict_type works with LoRA + FSDP1")
+        else:
+            # On non-rank-0 with rank0_only=True the state_dict is empty by design
+            log(f"OK (empty state on non-rank-0, expected with rank0_only=True)")
     except BaseException as e:
-        log(f"  approach B FAIL: {type(e).__name__}: {e}")
-
-    if rank == 0:
-        log("Test complete.")
+        log(f"FAIL: {type(e).__name__}: {e}")
+        raise
 
     dist.destroy_process_group()
 

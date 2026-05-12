@@ -610,7 +610,23 @@ def _prepare_state_dict(
     process_group: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, Any]:
     del process_group  # I feel like these torch functions should take a process group argument.
-    sd_options = dist_cp_sd.StateDictOptions(full_state_dict=False, cpu_offload=False)
+
+    # PEFT (LoRA) wraps every nn.Linear with a LoraLayer that has nested
+    # `base_layer` + `lora_A` + `lora_B` modules. The model's state_dict
+    # then contains keys like `attn_out.base_layer.weight` instead of
+    # `attn_out.weight`. FSDP1's SHARDED_STATE_DICT post-hook
+    # (_common_unshard_post_state_dict_hook) asserts the un-wrapped names
+    # are present and crashes the save. Detect PEFT models and switch to
+    # FULL_STATE_DICT, which gathers everything on rank 0 and bypasses
+    # the buggy hook entirely. Costs an extra ~16 GB of CPU RAM on rank 0
+    # at save time for an 8B-param model in bf16; the box has plenty.
+    is_peft_wrapped = type(model).__name__ in ("PeftModel", "PeftModelForCausalLM") or any(
+        type(m).__name__ in ("LoraLayer",) for m in model.modules()
+    )
+    sd_options = dist_cp_sd.StateDictOptions(
+        full_state_dict=is_peft_wrapped,
+        cpu_offload=is_peft_wrapped,
+    )
     state_dict: Dict[str, Any] = {
         "model": dist_cp_sd.get_model_state_dict(model, options=sd_options)
     }

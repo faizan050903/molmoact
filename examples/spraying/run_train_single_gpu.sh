@@ -47,6 +47,17 @@ LOG_FILE=${LOG_FILE:-$HOME/molmoact-logs/train_${RUN_NAME}.log}
 # --- Pre-flight ---
 cd "$HOME/molmoact"
 
+# CRITICAL: strip GCP's gIB-NCCL paths from LD_LIBRARY_PATH. Those point at
+# /usr/local/gib/lib{,64}/libnccl.so.2.27.5 (built for CUDA 12.8) which the
+# dynamic linker prefers over PyTorch's bundled NCCL 2.26.2 (built for CUDA
+# 12.6). The version skew causes every NCCL call to SIGSEGV. The GCP image's
+# startup scripts re-add /usr/local/gib/lib64 on every login, so we filter at
+# launch time.
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH=$(echo "$LD_LIBRARY_PATH" | tr ':' '\n' | \
+        grep -vE '/usr/local/gib' | grep -v '^$' | tr '\n' ':' | sed 's/:$//')
+fi
+
 if [ -z "${WANDB_API_KEY:-}" ]; then
     echo "ERROR: WANDB_API_KEY not set in environment" >&2
     exit 1

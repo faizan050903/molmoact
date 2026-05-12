@@ -73,9 +73,8 @@ def main():
     # Build model
     model = TinyModel(n_blocks=4, dim=256).to(local_rank)
 
-    # FSDP1 wrap with NO_SHARD: each rank keeps a full replica, like DDP.
-    # This avoids the broken FSDP gather code path that segfaults during
-    # state_dict export when PEFT-wrapped layers are present.
+    # FULL_SHARD matches production. NO_SHARD breaks at 8 GPUs + real 8B
+    # model in this PyTorch (SIGSEGV at init), so we can't use it.
     from torch.distributed.fsdp import ShardingStrategy
 
     auto_wrap = functools.partial(size_based_auto_wrap_policy, min_num_params=1024)
@@ -84,7 +83,7 @@ def main():
         use_orig_params=True,
         auto_wrap_policy=auto_wrap,
         device_id=local_rank,
-        sharding_strategy=ShardingStrategy.NO_SHARD,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
     )
 
     # PEFT LoRA wrap — same target as production: every Linear
@@ -102,25 +101,28 @@ def main():
     if rank == 0:
         log("PEFT wrap done; trying to save state_dict...")
 
-    # Truly bypass state_dict(). peft.get_peft_model_state_dict() internally
-    # calls model.state_dict() which triggers FSDP's broken post-hook. Iterate
-    # named_parameters() directly — it walks Parameter objects only, doesn't
-    # invoke any state_dict hooks.
-    log("Bypass: named_parameters() direct iteration (no state_dict() call)...")
+    # FSDP.summon_full_params materializes full unsharded tensors temporarily
+    # without calling state_dict() (so the broken FSDP state_dict hook is never
+    # invoked). Inside the context, p.data is the full parameter on rank 0;
+    # other ranks get empty placeholders when rank0_only=True.
+    log("FSDP.summon_full_params(writeback=False, rank0_only=True) context...")
 
     try:
         lora_state = {}
-        for name, p in peft_model.named_parameters():
-            if "lora_" in name and p.requires_grad:
-                # With NO_SHARD, .data is the full tensor (replicated on each rank).
-                lora_state[name] = p.data.detach().cpu().clone()
+        with FSDP.summon_full_params(peft_model, writeback=False, rank0_only=True):
+            if rank == 0:
+                for name, p in peft_model.named_parameters():
+                    if "lora_" in name and p.requires_grad:
+                        lora_state[name] = p.data.detach().cpu().clone()
         if rank == 0:
             keys = list(lora_state.keys())
             total_params = sum(t.numel() for t in lora_state.values())
             log(f"OK: {len(keys)} LoRA params, {total_params:,} total elements")
             log(f"sample key: {keys[0] if keys else '<empty>'}")
             log(f"sample shape: {lora_state[keys[0]].shape if keys else 'n/a'}")
-            log("PASS — named_parameters() bypass works with NO_SHARD FSDP + PEFT")
+            log("PASS — summon_full_params works with FULL_SHARD FSDP + PEFT")
+        else:
+            log("OK (rank 0 saves; other ranks idle in context)")
     except BaseException as e:
         log(f"FAIL: {type(e).__name__}: {e}")
         raise

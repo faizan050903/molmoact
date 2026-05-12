@@ -599,7 +599,25 @@ class Trainer:
         barrier()
         torch.cuda.synchronize(self.device)
 
-        self.fsdp_model.save_pretrained(checkpoint_dir)
+        # PEFT's PeftModel.save_pretrained() calls model.state_dict() under the
+        # hood, which triggers FSDP1's _full_post_state_dict_hook that asserts
+        # un-wrapped LoRA-renamed keys (e.g. expects `attn_out.weight`, finds
+        # `attn_out.base_layer.weight` + lora_A/B). Bypass: materialize full
+        # params under summon_full_params(rank0_only=True), build a state_dict
+        # manually from named_parameters() (no FSDP hook involved), then pass
+        # it to save_pretrained via the state_dict= kwarg so save_pretrained
+        # doesn't call model.state_dict() at all.
+        from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+        from torch.distributed import get_rank as _get_rank, is_initialized as _dist_inited
+        rank = _get_rank() if _dist_inited() else 0
+        with _FSDP.summon_full_params(self.fsdp_model, writeback=False, rank0_only=True):
+            if rank == 0:
+                manual_state_dict = {
+                    n: p.data.detach().cpu().clone()
+                    for n, p in self.fsdp_model.named_parameters()
+                    if p.requires_grad
+                }
+                self.fsdp_model.save_pretrained(checkpoint_dir, state_dict=manual_state_dict)
 
         if save_and_remove:
             self.remove_checkpoints(current_checkpoints, num_checkpoints_to_keep)

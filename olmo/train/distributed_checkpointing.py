@@ -143,10 +143,26 @@ def save_model_and_optim_state(
     if is_peft_wrapped:
         import os as _os
         import torch as _torch
+        from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
 
         rank = dist.get_rank(process_group) if dist.is_initialized() else 0
-        if rank == 0:
-            lora_state: Dict[str, Any] = {}
+        # Under FULL_SHARD, p.data on each rank is only the local shard. Use
+        # summon_full_params(rank0_only=True) to materialize the full tensors
+        # on rank 0 temporarily — other ranks block in the context manager.
+        # This is the only FSDP+PEFT save path that survives PyTorch 2.7.1's
+        # broken state_dict hooks (verified by examples/spraying/test_lora_fsdp_save.py).
+        if dist.is_initialized() and dist.get_world_size(process_group) > 1:
+            with _FSDP.summon_full_params(model, writeback=False, rank0_only=True):
+                if rank == 0:
+                    lora_state: Dict[str, Any] = {}
+                    for name, p in model.named_parameters():
+                        if p.requires_grad:
+                            lora_state[name] = p.data.detach().cpu().clone()
+                    _os.makedirs(str(dir), exist_ok=True)
+                    _torch.save({"model": lora_state}, _os.path.join(str(dir), "lora_state.pt"))
+        else:
+            # Single-rank: no sharding, p.data is the full tensor.
+            lora_state = {}
             for name, p in model.named_parameters():
                 if p.requires_grad:
                     lora_state[name] = p.data.detach().cpu().clone()

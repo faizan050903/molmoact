@@ -73,15 +73,18 @@ def main():
     # Build model
     model = TinyModel(n_blocks=4, dim=256).to(local_rank)
 
-    # FSDP1 wrap matching production's "by_block_and_size" strategy.
-    # Modern PyTorch calls the policy with module=/recurse=/nonwrapped_numel= kwargs,
-    # so bind min_num_params via functools.partial instead of a lambda.
+    # FSDP1 wrap with NO_SHARD: each rank keeps a full replica, like DDP.
+    # This avoids the broken FSDP gather code path that segfaults during
+    # state_dict export when PEFT-wrapped layers are present.
+    from torch.distributed.fsdp import ShardingStrategy
+
     auto_wrap = functools.partial(size_based_auto_wrap_policy, min_num_params=1024)
     fsdp_model = FSDP(
         model,
         use_orig_params=True,
         auto_wrap_policy=auto_wrap,
         device_id=local_rank,
+        sharding_strategy=ShardingStrategy.NO_SHARD,
     )
 
     # PEFT LoRA wrap — same target as production: every Linear

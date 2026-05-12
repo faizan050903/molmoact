@@ -130,7 +130,6 @@ torchrun \
     --lora_dropout 0.0 \
     --img_aug \
     --fsdp.fsdp2=False \
-    --fsdp.sharding_strategy=NO_SHARD \
     --save_intermediate_unsharded_checkpoint \
     --save_final_unsharded_checkpoint \
     2>&1 | tee "${LOG_FILE}"

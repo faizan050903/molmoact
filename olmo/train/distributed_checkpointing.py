@@ -623,9 +623,12 @@ def _prepare_state_dict(
     is_peft_wrapped = type(model).__name__ in ("PeftModel", "PeftModelForCausalLM") or any(
         type(m).__name__ in ("LoraLayer",) for m in model.modules()
     )
+    # NOTE: cpu_offload=True with full_state_dict=True segfaults inside PyTorch's
+    # C++ FSDP gather code (PyTorch 2.7.1 + nvidia-nccl-cu12==2.26.2). Keep gather
+    # on-GPU; the saved state still gets written from rank 0 once gathered.
     sd_options = dist_cp_sd.StateDictOptions(
         full_state_dict=is_peft_wrapped,
-        cpu_offload=is_peft_wrapped,
+        cpu_offload=False,
     )
     state_dict: Dict[str, Any] = {
         "model": dist_cp_sd.get_model_state_dict(model, options=sd_options)

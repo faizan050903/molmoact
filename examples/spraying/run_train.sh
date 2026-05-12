@@ -20,12 +20,19 @@
 #   PyTorch 2.7.1+cu126 ships 2.26.2 — version skew segfaults gIB on this VM
 #   image). For single-node training NVLink P2P handles intra-node bandwidth
 #   anyway, so socket transport is functionally equivalent.
+# - --fsdp.sharding_strategy=NO_SHARD: with FULL_SHARD, the FSDP state_dict
+#   hook tries to gather LoRA-wrapped parameters and SIGSEGVs in PyTorch's
+#   C++ FSDP code (any of the state_dict APIs trigger it). NO_SHARD makes
+#   FSDP behave like DDP — each rank keeps a full replica — eliminating the
+#   cross-rank gather entirely. Memory cost: ~16 GB bf16 model per GPU
+#   instead of sharded ~2 GB; A100 80 GB has plenty of headroom.
+# - The save path in olmo/train/distributed_checkpointing.py is also patched
+#   to detect PEFT-wrapped models and bypass dist_cp.state_dict_saver
+#   entirely. Rank 0 iterates named_parameters() and writes a plain
+#   `lora_state.pt` via torch.save — no FSDP state_dict() call at all.
 # - --save_intermediate_unsharded_checkpoint / --save_final_unsharded_checkpoint:
-#   FSDP1's SHARDED_STATE_DICT post-hook expects un-wrapped param names like
-#   `attn_out.weight`, but PEFT's LoRA wrapper renames them to
-#   `attn_out.base_layer.weight` (plus lora_A/lora_B), so the sharded save
-#   asserts. The unsharded path gathers FULL_STATE_DICT on rank 0 and writes
-#   one consolidated checkpoint per save, sidestepping the buggy hook.
+#   still kept on so the trainer also writes an unsharded checkpoint copy
+#   (cheap given the LoRA bypass writes the only thing that matters).
 
 set -euo pipefail
 
@@ -123,6 +130,7 @@ torchrun \
     --lora_dropout 0.0 \
     --img_aug \
     --fsdp.fsdp2=False \
+    --fsdp.sharding_strategy=NO_SHARD \
     --save_intermediate_unsharded_checkpoint \
     --save_final_unsharded_checkpoint \
     2>&1 | tee "${LOG_FILE}"

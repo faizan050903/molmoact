@@ -133,6 +133,29 @@ def save_model_and_optim_state(
     :raises FileExistsError: If the checkpoint dir exists and is non-empty unless ``save_overwrite=True``.
     """
     dir = _prepare_env_for_save(dir, process_group=process_group, save_overwrite=save_overwrite)
+
+    # PEFT-wrapped models hit broken FSDP state_dict hooks; bypass dist_cp entirely.
+    # With NO_SHARD sharding strategy, every rank has the full parameter data, so
+    # rank 0 alone can write the LoRA adapter via plain torch.save.
+    is_peft_wrapped = type(model).__name__ in ("PeftModel", "PeftModelForCausalLM") or any(
+        type(m).__name__ in ("LoraLayer",) for m in model.modules()
+    )
+    if is_peft_wrapped:
+        import os as _os
+        import torch as _torch
+
+        rank = dist.get_rank(process_group) if dist.is_initialized() else 0
+        if rank == 0:
+            lora_state: Dict[str, Any] = {}
+            for name, p in model.named_parameters():
+                if p.requires_grad:
+                    lora_state[name] = p.data.detach().cpu().clone()
+            _os.makedirs(str(dir), exist_ok=True)
+            _torch.save({"model": lora_state}, _os.path.join(str(dir), "lora_state.pt"))
+        if dist.is_initialized():
+            dist.barrier(group=process_group)
+        return
+
     state_dict = _prepare_state_dict(model, optim=optim, process_group=process_group)
     planner = DefaultSavePlanner(dedup_save_to_lowest_rank=True)
     dist_cp.state_dict_saver.save(

@@ -49,6 +49,35 @@ def main():
     print(f"  containing '.lora_A.':            {sum('.lora_A.' in k for k in keys)}")
     print(f"  containing '.lora_B.':            {sum('.lora_B.' in k for k in keys)}")
 
+    print("\n--- Distinct target module names (segment immediately before .lora_A.) ---")
+    # E.g., from "...blocks.0.att_proj.lora_A.weight" extract "att_proj".
+    targets = Counter()
+    for k in keys:
+        if ".lora_A." in k:
+            seg = k.split(".lora_A.")[0].split(".")[-1]
+            targets[seg] += 1
+    for seg, n in targets.most_common():
+        print(f"  {n:4d}× {seg}")
+
+    print("\n--- 5 sample non-transformer-block keys (no 'transformer.blocks') ---")
+    non_block = [k for k in keys if "transformer.blocks" not in k]
+    print(f"  total non-block: {len(non_block)}")
+    for k in sorted(set(non_block))[:8]:
+        print(f"  {k}")
+
+    print("\n--- Distinct parent paths for non-transformer-block keys ---")
+    parent_paths = Counter()
+    for k in non_block:
+        if ".lora_A." in k or ".lora_B." in k:
+            parent = k.replace("._fsdp_wrapped_module", "").replace("._checkpoint_wrapped_module", "")
+            for marker in (".lora_A.", ".lora_B."):
+                if marker in parent:
+                    parent = parent.split(marker)[0]
+                    break
+            parent_paths[parent] += 1
+    for p, n in parent_paths.most_common(20):
+        print(f"  {n:4d}× {p}")
+
 
 if __name__ == "__main__":
     main()

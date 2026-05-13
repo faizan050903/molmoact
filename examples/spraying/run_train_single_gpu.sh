@@ -98,10 +98,12 @@ if [ -n "${KNOCKKNOCK_SLACK_WEBHOOK:-}" ]; then
     elif [ -z "${KNOCKKNOCK_SLACK_CHANNEL:-}" ]; then
         echo "  Slack notify:    SKIPPED (KNOCKKNOCK_SLACK_WEBHOOK set but KNOCKKNOCK_SLACK_CHANNEL is empty — knockknock's CLI requires --channel)"
     else
+        # knockknock's parse_known_args leaves a literal '--' separator in
+        # the remaining args, which subprocess.run then tries to execute and
+        # fails with FileNotFoundError. Pass the wrapped command directly.
         KK_PREFIX=(knockknock slack
             --webhook-url "${KNOCKKNOCK_SLACK_WEBHOOK}"
-            --channel "${KNOCKKNOCK_SLACK_CHANNEL}"
-            --)
+            --channel "${KNOCKKNOCK_SLACK_CHANNEL}")
         echo "  Slack notify:    ENABLED (channel: ${KNOCKKNOCK_SLACK_CHANNEL})"
     fi
 else

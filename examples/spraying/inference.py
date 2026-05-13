@@ -103,11 +103,13 @@ def remap_adapter_keys(state_dict, hf_linear_paths):
             continue
         # Build the HF-expected key. PEFT prepends "base_model.model." to base
         # paths; HF base is MolmoActForImageTextToText, so inner Molmo is at .model
-        # -> two `.model.` segments after base_model.
-        # Suffix: lora_{A,B}.weight -> lora_{A,B}.default.weight
-        new_k = f"base_model.model.model.{chosen}.{lora_marker}.default.{tail}"
-        # tail is already e.g. "weight"; if it was something exotic, we leave it.
-        # But tail from "lora_A.weight" partition is "weight" (correct).
+        # -> two `.model.` segments after base_model. Suffix is left as
+        # "lora_{A,B}.weight" — PEFT's loader (_insert_adapter_name_into_state_dict)
+        # injects the adapter name itself, producing the in-model
+        # "...lora_{A,B}.default.weight". Adding `.default.` here too would yield
+        # "...lora_{A,B}.default.default.weight" and PEFT would silently report
+        # every key as missing.
+        new_k = f"base_model.model.model.{chosen}.{lora_marker}.{tail}"
         mapped[new_k] = v
     return mapped, unmapped
 
@@ -182,6 +184,38 @@ def prepare_clean_adapter(adapter_dir: Path, base_model) -> Path:
     save_file(mapped, str(tmp / "adapter_model.safetensors"))
     print(f"  cleaned adapter at {tmp}")
     return tmp
+
+
+def patch_build_input_embeddings_for_multi_device(base_model):
+    """When device_map="auto" shards MolmoAct across two GPUs, the in-place
+    `x[is_image_patch] += image_features` in `build_input_embeddings` crashes
+    because `x` (text embeddings, from wte on cuda:0) and `image_features`
+    (output of vision_backbone, possibly on cuda:1) are on different devices.
+
+    Wrap the offending method to `.to(x.device)` the image_features before the
+    add. We bind the wrapped function to the inner MolmoAct module that owns
+    `build_input_embeddings` (`MolmoActForImageTextToText.model`)."""
+    import types
+    inner = base_model.model if hasattr(base_model, "model") else base_model
+    if not hasattr(inner, "build_input_embeddings"):
+        raise RuntimeError("Could not find build_input_embeddings on base_model.model")
+
+    def build_input_embeddings(self, input_ids, images=None, image_masks=None, pooled_patches_idx=None):
+        input_ids = input_ids * (input_ids != -1).to(input_ids.dtype)
+        x = self.transformer.wte(input_ids)
+        image_features = None
+        if images is not None:
+            image_features = self.vision_backbone(images, pooled_patches_idx)
+            is_image_patch = input_ids.view(-1) == self.config.image_patch_id
+            assert is_image_patch.sum() == len(image_features)
+            # Move image_features to x's device before the in-place add. This
+            # is the only line that differs from the upstream method.
+            x.view(-1, x.shape[-1])[is_image_patch] += image_features.to(x.device, dtype=x.dtype)
+        x = self.transformer.emb_drop(x)
+        return x, image_features
+
+    inner.build_input_embeddings = types.MethodType(build_input_embeddings, inner)
+    print(f"  patched build_input_embeddings on {type(inner).__name__} for multi-device dispatch")
 
 
 def find_norm_stats_owner(model):
@@ -313,8 +347,9 @@ def main():
     )
     base = AutoModelForImageTextToText.from_pretrained(
         args.base_model, trust_remote_code=True,
-        torch_dtype=torch.bfloat16, device_map="cuda",
+        torch_dtype=torch.bfloat16, device_map="auto",
     )
+    patch_build_input_embeddings_for_multi_device(base)
 
     # --- Clean adapter (remap keys using base's actual module paths) ---
     print(f"[2/5] Cleaning adapter keys + config...")
@@ -332,7 +367,8 @@ def main():
     for name, mod in base.named_modules():
         if isinstance(mod, nn.Linear) and name.split(".")[-1] in target_names:
             for ab in ("lora_A", "lora_B"):
-                expected_keys.add(f"base_model.model.{name}.{ab}.default.weight")
+                # Save-format keys: no `.default.` — PEFT's loader injects it.
+                expected_keys.add(f"base_model.model.{name}.{ab}.weight")
     print(f"  PEFT will look for {len(expected_keys)} lora_* parameter keys")
     produced = set(load_file(str(clean_adapter_dir / "adapter_model.safetensors")).keys())
     matched = produced & expected_keys

@@ -93,18 +93,19 @@ echo "  Wandb:           ${WANDB_ENTITY}/${WANDB_PROJECT}/${RUN_NAME}"
 # Requires: uv pip install knockknock
 KK_PREFIX=()
 if [ -n "${KNOCKKNOCK_SLACK_WEBHOOK:-}" ]; then
-    if command -v knockknock >/dev/null 2>&1; then
-        KK_PREFIX=(knockknock slack --webhook-url "${KNOCKKNOCK_SLACK_WEBHOOK}")
-        if [ -n "${KNOCKKNOCK_SLACK_CHANNEL:-}" ]; then
-            KK_PREFIX+=(--channel "${KNOCKKNOCK_SLACK_CHANNEL}")
-        fi
-        KK_PREFIX+=(--)
-        echo "  Slack notify:    ENABLED${KNOCKKNOCK_SLACK_CHANNEL:+ (channel: ${KNOCKKNOCK_SLACK_CHANNEL})}"
-    else
+    if ! command -v knockknock >/dev/null 2>&1; then
         echo "  Slack notify:    SKIPPED (KNOCKKNOCK_SLACK_WEBHOOK set but 'knockknock' not installed — run: uv pip install knockknock)"
+    elif [ -z "${KNOCKKNOCK_SLACK_CHANNEL:-}" ]; then
+        echo "  Slack notify:    SKIPPED (KNOCKKNOCK_SLACK_WEBHOOK set but KNOCKKNOCK_SLACK_CHANNEL is empty — knockknock's CLI requires --channel)"
+    else
+        KK_PREFIX=(knockknock slack
+            --webhook-url "${KNOCKKNOCK_SLACK_WEBHOOK}"
+            --channel "${KNOCKKNOCK_SLACK_CHANNEL}"
+            --)
+        echo "  Slack notify:    ENABLED (channel: ${KNOCKKNOCK_SLACK_CHANNEL})"
     fi
 else
-    echo "  Slack notify:    off (set KNOCKKNOCK_SLACK_WEBHOOK to enable)"
+    echo "  Slack notify:    off (set KNOCKKNOCK_SLACK_WEBHOOK and KNOCKKNOCK_SLACK_CHANNEL to enable)"
 fi
 echo "================================================================"
 

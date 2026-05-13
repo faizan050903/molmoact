@@ -320,8 +320,37 @@ def main():
     print(f"[2/5] Cleaning adapter keys + config...")
     clean_adapter_dir = prepare_clean_adapter(adapter_dir, base)
 
+    # --- Predict PEFT's expected key set without actually wrapping base ---
+    # PEFT walks the base model for nn.Linear modules whose last-segment name
+    # appears in target_modules, and creates lora_{A,B}.default.weight for each.
+    # The expected key is "base_model.model.{module_path}.lora_{A,B}.default.weight".
+    import torch.nn as nn
+    print(f"[3a/5] Computing expected PEFT keys from base + adapter_config...")
+    cfg_dict = json.load(open(clean_adapter_dir / "adapter_config.json"))
+    target_names = set(cfg_dict.get("target_modules", []) or [])
+    expected_keys = set()
+    for name, mod in base.named_modules():
+        if isinstance(mod, nn.Linear) and name.split(".")[-1] in target_names:
+            for ab in ("lora_A", "lora_B"):
+                expected_keys.add(f"base_model.model.{name}.{ab}.default.weight")
+    print(f"  PEFT will look for {len(expected_keys)} lora_* parameter keys")
+    produced = set(load_file(str(clean_adapter_dir / "adapter_model.safetensors")).keys())
+    matched = produced & expected_keys
+    missing = expected_keys - produced
+    extra = produced - expected_keys
+    print(f"  remapped-file keys: {len(produced)}, PEFT-expected: {len(expected_keys)}")
+    print(f"  matched: {len(matched)}, missing-from-our-file: {len(missing)}, extra-in-our-file: {len(extra)}")
+    if missing:
+        print(f"  -- 8 examples of keys PEFT expected but we didn't produce: --")
+        for k in sorted(missing)[:8]:
+            print(f"    {k}")
+    if extra:
+        print(f"  -- 8 examples of keys we produced but PEFT didn't expect: --")
+        for k in sorted(extra)[:8]:
+            print(f"    {k}")
+
     # --- Attach LoRA ---
-    print(f"[3/5] Attaching LoRA adapter...")
+    print(f"[3b/5] Attaching LoRA adapter...")
     from peft import PeftModel
     model = PeftModel.from_pretrained(base, str(clean_adapter_dir))
     model.eval()

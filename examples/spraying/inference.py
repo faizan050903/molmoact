@@ -171,7 +171,11 @@ def main():
     ap.add_argument("--unnorm_key", default="spraying-v1-cleaned-processed",
                     help="Key in dataset_statistics.json for action de-normalization.")
     ap.add_argument("--base_model", default="allenai/MolmoAct-7B-D-0812")
-    ap.add_argument("--max_new_tokens", type=int, default=512)
+    # Depth alone can fill ~256 tokens before trace+action are emitted, so 1024
+    # is the safe floor for diagnosing whether the action chunk is generated.
+    ap.add_argument("--max_new_tokens", type=int, default=1024)
+    ap.add_argument("--print_full_text", action="store_true",
+                    help="Print the entire generated string (not the 800-char head).")
     args = ap.parse_args()
 
     adapter_dir = Path(os.path.expanduser(args.adapter_dir))
@@ -254,8 +258,25 @@ def main():
         generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0]
 
-    print(f"\n=== Generated text (first 800 chars) ===")
-    print(generated_text[:800])
+    n_generated = generated_tokens.size(1)
+    print(f"\n=== Generated text ({len(generated_text)} chars, {n_generated} tokens) ===")
+    if args.print_full_text or len(generated_text) <= 1200:
+        print(generated_text)
+    else:
+        print(generated_text[:600])
+        print("\n  ...[middle elided]...\n")
+        print(generated_text[-600:])
+
+    # Locate the action-emission cue so we can confirm whether the model got
+    # past depth+trace into the action phase.
+    cue = "the action that the robot should take is"
+    cue_idx = generated_text.lower().find(cue)
+    if cue_idx >= 0:
+        print(f"\n[diag] Found cue {cue!r} at char {cue_idx}; following 400 chars:")
+        print(generated_text[cue_idx:cue_idx + 400])
+    else:
+        print(f"\n[diag] Cue {cue!r} NOT found — model didn't reach the action phase "
+              f"within {args.max_new_tokens} tokens, or trained format differs.")
 
     print(f"\n=== Parsed outputs ===")
     underlying = find_norm_stats_owner(model)

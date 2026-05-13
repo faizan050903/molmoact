@@ -278,6 +278,9 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=1024)
     ap.add_argument("--print_full_text", action="store_true",
                     help="Print the entire generated string (not the 800-char head).")
+    ap.add_argument("--compare_no_adapter", action="store_true",
+                    help="Also generate with model.disable_adapter() and report if outputs differ. "
+                         "If outputs are identical the LoRA isn't contributing — diagnose loading.")
     args = ap.parse_args()
 
     adapter_dir = Path(os.path.expanduser(args.adapter_dir))
@@ -328,6 +331,30 @@ def main():
     if n_total_lora == 0:
         sys.exit("FATAL: 0 LoRA params after attach — remap likely produced wrong keys")
 
+    # --- Verify LoRA weights are nonzero (loaded properly, not just shaped) ---
+    print(f"  sampling LoRA weight norms (lora_B is initialized to 0 at training start;")
+    print(f"   trained checkpoints should have nonzero ||lora_B||):")
+    sampled = 0
+    nonzero_b = 0
+    for n, p in model.named_parameters():
+        if "lora_B" in n and sampled < 6:
+            norm = float(p.detach().float().norm().item())
+            print(f"    {n}: ||W||={norm:.6f}, shape={tuple(p.shape)}")
+            if norm > 1e-6:
+                nonzero_b += 1
+            sampled += 1
+    # Quick scan across ALL lora_B for nonzero count
+    total_b = 0
+    total_nonzero_b = 0
+    for n, p in model.named_parameters():
+        if ".lora_B." in n:
+            total_b += 1
+            if float(p.detach().float().norm().item()) > 1e-6:
+                total_nonzero_b += 1
+    print(f"  lora_B nonzero count: {total_nonzero_b}/{total_b}")
+    if total_nonzero_b == 0:
+        print(f"  WARNING: every lora_B is zero — weights weren't loaded into the LoRA layers")
+
     # --- Inject spraying norm_stats ---
     print(f"[4/5] Injecting norm_stats from {args.norm_stats_path}...")
     keys_after = inject_norm_stats(model, Path(args.norm_stats_path))
@@ -355,13 +382,38 @@ def main():
     inputs = processor(images=[[base_image, wrist_image]], text=text, padding=True, return_tensors="pt")
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
 
-    print(f"Running generate(max_new_tokens={args.max_new_tokens})...")
+    print(f"Running generate(max_new_tokens={args.max_new_tokens}) WITH adapter...")
     with torch.inference_mode(), torch.autocast("cuda", enabled=True, dtype=torch.bfloat16):
         generated_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
     generated_tokens = generated_ids[:, inputs["input_ids"].size(1):]
     generated_text = processor.batch_decode(
         generated_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0]
+
+    # --- Adapter-off sanity check ---
+    # If the adapter is doing anything, the output should differ from base.
+    # PEFT's disable_adapter() context turns off LoRA contribution in forward.
+    if args.compare_no_adapter:
+        print(f"\nRunning generate(max_new_tokens={args.max_new_tokens}) WITHOUT adapter (disable_adapter)...")
+        with torch.inference_mode(), torch.autocast("cuda", enabled=True, dtype=torch.bfloat16):
+            with model.disable_adapter():
+                base_ids = model.generate(**inputs, max_new_tokens=args.max_new_tokens)
+        base_tokens = base_ids[:, inputs["input_ids"].size(1):]
+        base_text = processor.batch_decode(
+            base_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+        same = (generated_tokens.shape == base_tokens.shape and
+                bool((generated_tokens == base_tokens).all().item()))
+        print(f"\n=== Adapter on/off comparison ===")
+        print(f"  with adapter:    {len(generated_text)} chars, {generated_tokens.size(1)} tokens")
+        print(f"  without adapter: {len(base_text)} chars, {base_tokens.size(1)} tokens")
+        print(f"  outputs identical (token IDs): {same}")
+        if same:
+            print(f"  >>> LoRA contribution = 0. Loaded but not applied. Investigate scaling/wiring.")
+        else:
+            # Show the last 200 chars of each so we can compare action segments
+            print(f"\n  (adapter)  tail: ...{generated_text[-200:]}")
+            print(f"  (no adpt)  tail: ...{base_text[-200:]}")
 
     n_generated = generated_tokens.size(1)
     print(f"\n=== Generated text ({len(generated_text)} chars, {n_generated} tokens) ===")

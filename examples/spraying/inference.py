@@ -40,33 +40,126 @@ from PIL import Image
 from safetensors.torch import load_file, save_file
 
 
-def strip_fsdp_prefixes(state_dict):
-    """Rewrite adapter keys to match the HF model's PEFT layout.
+WRAP_SEGMENTS = ("self_attn", "mlp", "attention", "feed_forward")
 
-    Training-time wrapping (saved into the adapter):
-        base_model.model._fsdp_wrapped_module.<X>._checkpoint_wrapped_module._fsdp_wrapped_module.<Y>.lora_A.default.weight
 
-    HF-time PEFT layout (what PeftModel.from_pretrained expects):
-        base_model.model.model.<X>.<Y>.lora_A.default.weight
+def _strip_fsdp(k: str) -> str:
+    return (k.replace("._fsdp_wrapped_module", "")
+             .replace("._checkpoint_wrapped_module", "")
+             .replace("_fsdp_wrapped_module.", "")
+             .replace("._fsdp_wrapped_module", ""))
 
-    Two transforms:
-    1. Drop `._fsdp_wrapped_module` and `._checkpoint_wrapped_module` (FSDP wraps).
-    2. Insert an extra `.model.` after `base_model.model.` — because at HF
-       inference, `PeftModel.base_model.model` is the HuggingFace
-       `MolmoActForImageTextToText` wrapper which itself contains `.model` (the
-       inner Molmo), whereas at training time PEFT wrapped the inner Molmo
-       directly. So the path has one extra `.model.` in the HF case.
+
+def remap_adapter_keys(state_dict, hf_linear_paths):
+    """Rewrite training-time adapter keys to match HF MolmoAct's PEFT layout.
+
+    Saved (training-time, FSDP-wrapped, inner Molmo as base):
+      base_model.model._fsdp_wrapped_module.transformer.blocks.0._checkpoint_wrapped_module._fsdp_wrapped_module.att_proj.lora_A.weight
+
+    Expected (HF inference, MolmoActForImageTextToText as base, PEFT default-adapter name):
+      base_model.model.model.transformer.blocks.0.self_attn.att_proj.lora_A.default.weight
+
+    Steps per key:
+      1. Strip FSDP/checkpoint wrapper segments.
+      2. Detect target module name (segment right before .lora_A/.lora_B).
+      3. Extract the path within the inner Molmo (i.e. after "base_model.model.").
+      4. Match it to an HF linear by trying the bare path, then inserting one
+         of {self_attn, mlp, attention, feed_forward} immediately before the
+         target name. The first variant that matches an actual HF linear wins.
+      5. Prepend "base_model.model.model." and rewrite the suffix
+         lora_{A,B}.weight -> lora_{A,B}.default.weight.
+
+    Returns (mapped_state_dict, unmapped_keys).
     """
-    cleaned = {}
-    for k, v in state_dict.items():
-        new_k = k.replace("._fsdp_wrapped_module", "").replace("._checkpoint_wrapped_module", "")
-        if new_k.startswith("base_model.model.") and not new_k.startswith("base_model.model.model."):
-            new_k = "base_model.model.model." + new_k[len("base_model.model."):]
-        cleaned[new_k] = v
-    return cleaned
+    mapped = {}
+    unmapped = []
+    for raw_k, v in state_dict.items():
+        k = _strip_fsdp(raw_k)
+        # Split out the lora marker
+        if ".lora_A." in k:
+            head, _, tail = k.partition(".lora_A.")
+            lora_marker = "lora_A"
+        elif ".lora_B." in k:
+            head, _, tail = k.partition(".lora_B.")
+            lora_marker = "lora_B"
+        else:
+            unmapped.append((raw_k, "no .lora_A./.lora_B. marker"))
+            continue
+        # `head` like "base_model.model.transformer.blocks.0.att_proj"
+        if not head.startswith("base_model.model."):
+            unmapped.append((raw_k, f"head doesn't start with base_model.model.: {head}"))
+            continue
+        inner = head[len("base_model.model."):]  # "transformer.blocks.0.att_proj"
+        segs = inner.split(".")
+        target_name = segs[-1]
+        parent_segs = segs[:-1]
+        # Candidate paths (in order of preference): bare, then with each wrap inserted before target
+        candidates = [".".join(parent_segs + [target_name])]
+        for wrap in WRAP_SEGMENTS:
+            candidates.append(".".join(parent_segs + [wrap, target_name]))
+        chosen = next((c for c in candidates if c in hf_linear_paths), None)
+        if chosen is None:
+            unmapped.append((raw_k, f"no HF linear matches any of {candidates[:3]}..."))
+            continue
+        # Build the HF-expected key. PEFT prepends "base_model.model." to base
+        # paths; HF base is MolmoActForImageTextToText, so inner Molmo is at .model
+        # -> two `.model.` segments after base_model.
+        # Suffix: lora_{A,B}.weight -> lora_{A,B}.default.weight
+        new_k = f"base_model.model.model.{chosen}.{lora_marker}.default.{tail}"
+        # tail is already e.g. "weight"; if it was something exotic, we leave it.
+        # But tail from "lora_A.weight" partition is "weight" (correct).
+        mapped[new_k] = v
+    return mapped, unmapped
 
 
-def prepare_clean_adapter(adapter_dir: Path) -> Path:
+def collect_hf_linear_paths(base_model):
+    """Walk the HF base model and return the set of paths (relative to the
+    base, i.e. with the outermost `.model.` prefix already stripped by named_modules
+    indexing on `.model`) of every nn.Linear.
+
+    PEFT prepends `base_model.model.` to the base_model object name, but
+    `named_modules()` of the HF wrapper itself gives e.g. `model.transformer.
+    blocks.0.self_attn.att_proj` — which is what we use here, treating the
+    inner-Molmo prefix `model.` as part of the path.
+
+    Returns paths *without* the leading `model.` because our remapper builds
+    candidates against the inner-Molmo path (i.e., what comes after
+    `base_model.model.model.`)."""
+    import torch.nn as nn
+    paths = set()
+    for name, mod in base_model.named_modules():
+        if isinstance(mod, nn.Linear):
+            # Strip leading "model." since our cleaned-key inner-path doesn't have it.
+            paths.add(name[len("model."):] if name.startswith("model.") else name)
+    return paths
+
+
+def fix_adapter_config_target_modules(cfg_src: Path, cfg_dst: Path):
+    """Copy adapter_config.json to cfg_dst, scrubbing `_fsdp_wrapped_module`
+    artifacts from target_modules so PEFT can match them in the HF model.
+
+    Training-time PEFT auto-discovered modules WHILE THE MODEL WAS ALREADY
+    FSDP-wrapped, so it captured names like "_fsdp_wrapped_module.ff_out"
+    and "ff_out._fsdp_wrapped_module" — those will never match anything in
+    an unwrapped HF model."""
+    with open(cfg_src) as f:
+        cfg = json.load(f)
+    tm = cfg.get("target_modules")
+    if isinstance(tm, list):
+        cleaned = []
+        for name in tm:
+            cleaned_name = name.replace("_fsdp_wrapped_module.", "").replace("._fsdp_wrapped_module", "")
+            cleaned_name = cleaned_name.strip(".")
+            if cleaned_name and cleaned_name not in cleaned:
+                cleaned.append(cleaned_name)
+        if cleaned != tm:
+            print(f"  scrubbed target_modules: {tm} -> {cleaned}")
+        cfg["target_modules"] = cleaned
+    with open(cfg_dst, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def prepare_clean_adapter(adapter_dir: Path, base_model) -> Path:
     config_src = adapter_dir / "adapter_config.json"
     weights_src = adapter_dir / "adapter_model.safetensors"
     if not config_src.exists():
@@ -74,11 +167,20 @@ def prepare_clean_adapter(adapter_dir: Path) -> Path:
     if not weights_src.exists():
         sys.exit(f"adapter_model.safetensors missing at {weights_src}")
     tmp = Path(tempfile.mkdtemp(prefix="molmoact_adapter_clean_"))
-    shutil.copy(config_src, tmp / "adapter_config.json")
+    fix_adapter_config_target_modules(config_src, tmp / "adapter_config.json")
     raw = load_file(str(weights_src))
-    clean = strip_fsdp_prefixes(raw)
-    save_file(clean, str(tmp / "adapter_model.safetensors"))
-    print(f"  cleaned adapter at {tmp} ({len(clean)} keys)")
+    hf_paths = collect_hf_linear_paths(base_model)
+    print(f"  HF base has {len(hf_paths)} nn.Linear modules")
+    mapped, unmapped = remap_adapter_keys(raw, hf_paths)
+    print(f"  remapped {len(mapped)}/{len(raw)} adapter keys")
+    if unmapped:
+        print(f"  WARNING: {len(unmapped)} keys could not be mapped to an HF linear:")
+        for raw_k, reason in unmapped[:6]:
+            print(f"    {raw_k} -- {reason}")
+        if len(unmapped) > 6:
+            print(f"    ... and {len(unmapped) - 6} more")
+    save_file(mapped, str(tmp / "adapter_model.safetensors"))
+    print(f"  cleaned adapter at {tmp}")
     return tmp
 
 
@@ -200,12 +302,8 @@ def main():
         instruction = args.instruction
         print(f"[setup] Using standalone images, instruction={instruction!r}")
 
-    # --- Clean adapter ---
-    print(f"[1/5] Cleaning adapter keys...")
-    clean_adapter_dir = prepare_clean_adapter(adapter_dir)
-
-    # --- Load base ---
-    print(f"[2/5] Loading HF base {args.base_model} (bf16, cuda)...")
+    # --- Load base first (we need its named_modules() to validate adapter key remap) ---
+    print(f"[1/5] Loading HF base {args.base_model} (bf16, cuda)...")
     from transformers import AutoProcessor, AutoModelForImageTextToText
     processor = AutoProcessor.from_pretrained(
         args.base_model, trust_remote_code=True, padding_side="left",
@@ -215,13 +313,20 @@ def main():
         torch_dtype=torch.bfloat16, device_map="cuda",
     )
 
+    # --- Clean adapter (remap keys using base's actual module paths) ---
+    print(f"[2/5] Cleaning adapter keys + config...")
+    clean_adapter_dir = prepare_clean_adapter(adapter_dir, base)
+
     # --- Attach LoRA ---
     print(f"[3/5] Attaching LoRA adapter...")
     from peft import PeftModel
     model = PeftModel.from_pretrained(base, str(clean_adapter_dir))
     model.eval()
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  adapter attached, {n_trainable:,} LoRA params")
+    n_total_lora = sum(p.numel() for n, p in model.named_parameters() if "lora_" in n)
+    print(f"  adapter attached: {n_trainable:,} trainable, {n_total_lora:,} total LoRA params")
+    if n_total_lora == 0:
+        sys.exit("FATAL: 0 LoRA params after attach — remap likely produced wrong keys")
 
     # --- Inject spraying norm_stats ---
     print(f"[4/5] Injecting norm_stats from {args.norm_stats_path}...")

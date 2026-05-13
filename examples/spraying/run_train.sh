@@ -104,6 +104,26 @@ echo "  LoRA rank/alpha: ${LORA_RANK}/${LORA_ALPHA}"
 echo "  Save interval:   ${SAVE_INTERVAL} (keep ${SAVE_KEEP})"
 echo "  LR (all groups): ${LR}"
 echo "  Wandb:           ${WANDB_ENTITY}/${WANDB_PROJECT}/${RUN_NAME}"
+
+# --- Optional: knockknock Slack notification on success/failure ---
+# Set KNOCKKNOCK_SLACK_WEBHOOK (and optionally KNOCKKNOCK_SLACK_CHANNEL) in env
+# to get a Slack message when training finishes or errors out. Requires:
+#   uv pip install knockknock
+KK_PREFIX=()
+if [ -n "${KNOCKKNOCK_SLACK_WEBHOOK:-}" ]; then
+    if command -v knockknock >/dev/null 2>&1; then
+        KK_PREFIX=(knockknock slack --webhook-url "${KNOCKKNOCK_SLACK_WEBHOOK}")
+        if [ -n "${KNOCKKNOCK_SLACK_CHANNEL:-}" ]; then
+            KK_PREFIX+=(--channel "${KNOCKKNOCK_SLACK_CHANNEL}")
+        fi
+        KK_PREFIX+=(--)
+        echo "  Slack notify:    ENABLED${KNOCKKNOCK_SLACK_CHANNEL:+ (channel: ${KNOCKKNOCK_SLACK_CHANNEL})}"
+    else
+        echo "  Slack notify:    SKIPPED (KNOCKKNOCK_SLACK_WEBHOOK set but 'knockknock' not installed — run: uv pip install knockknock)"
+    fi
+else
+    echo "  Slack notify:    off (set KNOCKKNOCK_SLACK_WEBHOOK to enable)"
+fi
 echo "================================================================"
 
 # --- Launch ---
@@ -113,7 +133,7 @@ NCCL_P2P_DISABLE=0 \
 NCCL_SHM_DISABLE=0 \
 PYTHONPATH=. \
 WANDB_API_KEY=${WANDB_API_KEY} \
-torchrun \
+"${KK_PREFIX[@]}" torchrun \
     --nnodes=1 \
     --nproc-per-node="${NUM_GPUS}" \
     launch_scripts/train_multitask_model.py \
